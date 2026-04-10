@@ -11,6 +11,7 @@
         "opengl3-binding"
       ]
     },
+    "glm",
     "eigen3"
   ],
   "builtin-baseline": "81e3c888ef717a026eb57bb2f3cb0dbd30246271"
