@@ -16,6 +16,10 @@ CMakeUserPresets.json
 /build-*/
 /out/
 /out-*/
+<<<<<<< HEAD
+=======
+/vcpkg_installed
+>>>>>>> 7f88fe3 (chore: set up the project)
 CMakeCache.txt
 CMakeFiles/
 CMakeScripts/
@@ -41,4 +45,7 @@ CMakeUserPresets.json
 *.ilk
 *.pdb
 *.user
+<<<<<<< HEAD
 
+=======
+>>>>>>> 7f88fe3 (chore: set up the project)
