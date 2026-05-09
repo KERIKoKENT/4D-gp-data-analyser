@@ -87,11 +87,19 @@ void Renderer::SetupGrid(const Grid& grid) {
 
     glBindBuffer(GL_ARRAY_BUFFER, gridVBO);
 
-    glBufferData(GL_ARRAY_BUFFER, grid.getNodesCount() * 6 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, grid.getNodesCount() * 7 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
 
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)0);
+
     glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+
+    glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(3 * sizeof(float)));
+
+    glEnableVertexAttribArray(1);
+
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(4 * sizeof(float)));
+
+    glEnableVertexAttribArray(2);
 
     glBindVertexArray(0);
 }
@@ -123,7 +131,6 @@ void Renderer::DrawGrid(const Grid& grid) {
 
     glUniform3fv(glGetUniformLocation(program, "lightPos"), 1, glm::value_ptr(camPos));
     glUniform3fv(glGetUniformLocation(program, "viewPos"), 1, glm::value_ptr(camPos));
-    glUniform3f(glGetUniformLocation(program, "objectColor"), 0.2f, 0.6f, 1.0f);
 
     glBindVertexArray(gridVAO);
     glDrawElements(GL_TRIANGLES, gridIndexCount, GL_UNSIGNED_INT, 0);
