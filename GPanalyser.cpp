@@ -5,6 +5,9 @@
 #include "LBFGS.h"
 #include "src/Renderer.h"
 #include "src/Grid.h"
+#include "src/gp3d.h"
+
+#include <random>
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>

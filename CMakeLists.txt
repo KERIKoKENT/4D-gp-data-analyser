@@ -11,7 +11,7 @@ find_package(Eigen3 CONFIG REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(glad CONFIG REQUIRED)
 
-add_executable(${PROJECT_NAME} GPanalyser.cpp "src/Grid.cpp" "src/Grid.h" "src/Camera.cpp" "src/Camera.h" "src/Renderer.cpp" "src/Renderer.h")
+add_executable(${PROJECT_NAME} GPanalyser.cpp "src/Grid.cpp" "src/Grid.h" "src/Camera.cpp" "src/Camera.h" "src/Renderer.cpp" "src/Renderer.h"   "src/gp3d.cpp" "src/gp3d.h")
 
 target_link_libraries(${PROJECT_NAME}
     PRIVATE

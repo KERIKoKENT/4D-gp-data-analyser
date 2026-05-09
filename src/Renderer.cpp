@@ -2,12 +2,12 @@
 #include <sstream>
 #include <filesystem>
 #include <thread>
+#include <iostream>
 #include "Renderer.h"
 #include <glad/glad.h> 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
-#include <iostream>
 
 Renderer::Renderer(int width, int height, const char* title) {
     if (!glfwInit()) {
