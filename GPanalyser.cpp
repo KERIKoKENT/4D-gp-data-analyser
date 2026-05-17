@@ -27,7 +27,8 @@ void updateSurface(
     std::vector<float>& vData,
     const Grid& grid,
     GP3D& gp,
-    std::vector<float>& confidence
+    std::vector<float>& confidence,
+    float sliceW
 ) {
     confidence.clear();
 
@@ -38,77 +39,84 @@ void updateSurface(
 
     vData.assign(grid.getNodesCount() * 7, 0.0f);
 
-    for (int i = 0; i < nodes; ++i) {
-        for (int j = 0; j < nodes; ++j) {
+    try {
+        for (int i = 0; i < nodes; ++i) {
+            for (int j = 0; j < nodes; ++j) {
 
-            float x = i * step - halfSize;
-            float y = j * step - halfSize;
+                float x = i * step - halfSize;
+                float y = j * step - halfSize;
 
-            Eigen::Vector3d p;
-            p << x, y, 0.0;
+                Eigen::Vector3d p;
+                p << x, y, (double)sliceW;
 
-            auto [mean, var] = gp.predict(p);
+                auto [mean, var] = gp.predict(p);
 
-            float z = (float)mean;
+                float z = (float)mean;
 
-            float conf = exp(-(float)var * 3.0f);
+                float conf = exp(-(float)var * 3.0f);
 
-            if (invertConfidence)
-                conf = 1.0f - conf;
+                if (invertConfidence)
+                    conf = 1.0f - conf;
 
-            confidence.push_back(conf);
+                confidence.push_back(conf);
 
-            int idx = (i * nodes + j) * 7;
+                int idx = (i * nodes + j) * 7;
 
-            vData[idx + 0] = x;
-            vData[idx + 1] = y;
-            vData[idx + 2] = z;
+                vData[idx + 0] = x;
+                vData[idx + 1] = y;
+                vData[idx + 2] = z;
 
-            vData[idx + 3] = conf;
+                vData[idx + 3] = conf;
+            }
+        }
+
+        for (int i = 0; i < nodes; ++i) {
+            for (int j = 0; j < nodes; ++j) {
+
+                int idx = (i * nodes + j) * 7;
+
+                float z_left =
+                    (i > 0)
+                    ? vData[((i - 1) * nodes + j) * 7 + 2]
+                    : vData[idx + 2];
+
+                float z_right =
+                    (i < nodes - 1)
+                    ? vData[((i + 1) * nodes + j) * 7 + 2]
+                    : vData[idx + 2];
+
+                float z_down =
+                    (j > 0)
+                    ? vData[(i * nodes + (j - 1)) * 7 + 2]
+                    : vData[idx + 2];
+
+                float z_up =
+                    (j < nodes - 1)
+                    ? vData[(i * nodes + (j + 1)) * 7 + 2]
+                    : vData[idx + 2];
+
+                float dzdx = (z_right - z_left) / (2.0f * step);
+                float dzdy = (z_up - z_down) / (2.0f * step);
+
+                glm::vec3 n =
+                    glm::normalize(glm::vec3(-dzdx, -dzdy, 1.0f));
+
+                vData[idx + 4] = n.x;
+                vData[idx + 5] = n.y;
+                vData[idx + 6] = n.z;
+            }
         }
     }
-
-    for (int i = 0; i < nodes; ++i) {
-        for (int j = 0; j < nodes; ++j) {
-
-            int idx = (i * nodes + j) * 7;
-
-            float z_left =
-                (i > 0)
-                ? vData[((i - 1) * nodes + j) * 7 + 2]
-                : vData[idx + 2];
-
-            float z_right =
-                (i < nodes - 1)
-                ? vData[((i + 1) * nodes + j) * 7 + 2]
-                : vData[idx + 2];
-
-            float z_down =
-                (j > 0)
-                ? vData[(i * nodes + (j - 1)) * 7 + 2]
-                : vData[idx + 2];
-
-            float z_up =
-                (j < nodes - 1)
-                ? vData[(i * nodes + (j + 1)) * 7 + 2]
-                : vData[idx + 2];
-
-            float dzdx = (z_right - z_left) / (2.0f * step);
-            float dzdy = (z_up - z_down) / (2.0f * step);
-
-            glm::vec3 n =
-                glm::normalize(glm::vec3(-dzdx, -dzdy, 1.0f));
-
-            vData[idx + 4] = n.x;
-            vData[idx + 5] = n.y;
-            vData[idx + 6] = n.z;
-        }
-    }
+    catch (const std::exception& e) {
+        std::cerr << "Error during surface update: " << e.what() << std::endl;
+	}
 }
 
 int main() {
 
     bool surfaceDirty = false;
+
+	float currentW = 0.0;
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -127,6 +135,11 @@ int main() {
 
     LBFGSpp::LBFGSParam<double> param;
     param.max_iterations = 100;
+    param.m = 6;                    
+    param.max_linesearch = 50;            
+    param.min_step = 1e-20;               
+    param.max_step = 1e3;                 
+    param.epsilon = 1e-4;
 
     LBFGSpp::LBFGSSolver<double> solver(param);
 
@@ -147,12 +160,9 @@ int main() {
 
         double x = dist(rng);
         double yy = dist(rng);
-        double w = 0.0;
+        double w = dist(rng);
 
-        double z =
-            sin(x) * cos(yy)
-            + 0.5 * tanh(x - yy)
-            + 0.2 * sin(x * yy);
+        double z = sqrt(abs(100 - x * x - yy * yy - w * w));
 
         X(i, 0) = x;
         X(i, 1) = yy;
@@ -170,18 +180,28 @@ int main() {
     Eigen::VectorXd params(5);
 
     params <<
-        0.0,
-        0.0,
-        0.0,
+        1.0,
+        1.0,
+        10.0,
         0.0,
         -2.0;
 
 
     double fx;
 
-    solver.minimize(gp, params, fx);
+    try {
+        solver.minimize(gp, params, fx);
 
-    gp.fit(params);
+        gp.fit(params);
+    }
+    catch (const std::exception& e) {
+        std::cerr << "\n!!! FATAL ERROR !!!" << std::endl;
+        std::cerr << "Message: " << e.what() << std::endl;
+        std::cerr << "Params at the moment of crash: " << params.transpose() << std::endl;
+
+        
+        return -1;
+	}
 
     auto t1 = std::chrono::high_resolution_clock::now();
     std::cout << "X took: "
@@ -202,12 +222,12 @@ int main() {
 
     std::vector<float> vertexData;
 
-    updateSurface(vertexData, myGrid, gp, confidence);
+    updateSurface(vertexData, myGrid, gp, confidence, currentW);
 
     while (!renderer.ShouldClose()) {
 
         if (surfaceDirty) {
-            updateSurface(vertexData, myGrid, gp, confidence);
+            updateSurface(vertexData, myGrid, gp, confidence, currentW);
             surfaceDirty = false;
         }
 
@@ -249,12 +269,14 @@ int main() {
             std::exp(params[4])
         );
 
+        ImGui::SliderFloat("Z-Slice (W)", &currentW, -10.0f, 10.0f);
+
         if (ImGui::Checkbox("Invert confidence", &invertConfidence)) {
             surfaceDirty = true;
         }
 
         if (ImGui::Button("Rebuild Surface")) {
-            updateSurface(vertexData, myGrid, gp, confidence);
+            updateSurface(vertexData, myGrid, gp, confidence, currentW);
         }
 
         ImGui::End();
