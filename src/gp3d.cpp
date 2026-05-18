@@ -1,11 +1,18 @@
 #include "gp3d.h"
 #include <cmath>
-#include <Eigen/Eigenvalues>
+#include <iostream>
+#include <algorithm>
 
 using namespace Eigen;
 
+// Функция softplus
 static double softplus(double x) {
     return std::log1p(std::exp(-std::abs(x))) + std::max(x, 0.0);
+}
+
+// Производная функции softplus (логистическая сигмоида)
+static double softplus_deriv(double x) {
+    return 1.0 / (1.0 + std::exp(-x));
 }
 
 GP3D::GP3D(const MatrixXd& X_, const VectorXd& y_, const GPConfig& cfg)
@@ -40,7 +47,7 @@ MatrixXd GP3D::computeK(const VectorXd& p) const {
             K(j, i) = v;
         }
     }
-
+    
     double sn2 = softplus(p[4]);
     K.diagonal().array() += sn2 + config.jitter;
 
@@ -48,17 +55,14 @@ MatrixXd GP3D::computeK(const VectorXd& p) const {
 }
 
 double GP3D::operator()(const VectorXd& p, VectorXd& grad) {
-    VectorXd pp = p;
 
-    for (int i = 0; i < pp.size(); ++i)
-        pp[i] = std::max(std::min(pp[i], 10.0), -10.0);
-
-    MatrixXd K = computeK(pp);
-
+    MatrixXd K = computeK(p);
     LDLT<MatrixXd> ldlt(K);
 
-    if (ldlt.info() != Success)
-        return 1e50;
+    if (ldlt.info() != Success) {
+        grad.setZero(5);
+        return 1e10; // Возвращаем штрафной loss вместо падения программы
+    }
 
     VectorXd alpha_loc = ldlt.solve(y);
 
@@ -69,6 +73,11 @@ double GP3D::operator()(const VectorXd& p, VectorXd& grad) {
         0.5 * logdet -
         0.5 * N * std::log(2.0 * M_PI);
 
+    if (!std::isfinite(ll)) {
+        grad.setZero(5);
+        return 1e10;
+    }
+
     MatrixXd K_inv = ldlt.solve(MatrixXd::Identity(N, N));
     MatrixXd A = alpha_loc * alpha_loc.transpose() - K_inv;
 
@@ -76,53 +85,62 @@ double GP3D::operator()(const VectorXd& p, VectorXd& grad) {
 
     for (int d = 0; d < 3; ++d) {
         MatrixXd dK(N, N);
-
-        double ld = softplus(pp[d]);
-        double ld2 = ld * ld;
+        double ld = softplus(p[d]);
+        double ld3 = ld * ld * ld;
 
         for (int i = 0; i < N; ++i) {
             for (int j = i; j < N; ++j) {
-                double kij = kernel(i, j, pp);
+                double kij = kernel(i, j, p);
                 double diff = X(i, d) - X(j, d);
-                double val = kij * (diff * diff) / ld2;
+                double val = kij * (diff * diff) / ld3;
                 dK(i, j) = val;
                 dK(j, i) = val;
             }
         }
-
-        grad[d] = 0.5 * (A.cwiseProduct(dK)).sum();
+        grad[d] = 0.5 * (A.cwiseProduct(dK)).sum() * softplus_deriv(p[d]);
     }
 
     {
         MatrixXd dK(N, N);
+        double sf2 = softplus(p[3]);
 
         for (int i = 0; i < N; ++i) {
             for (int j = i; j < N; ++j) {
-                double kij = kernel(i, j, pp);
-                double val = 2.0 * kij;
+                double kij = kernel(i, j, p);
+                double val = (sf2 > 1e-9) ? (kij / sf2) : 0.0;
                 dK(i, j) = val;
                 dK(j, i) = val;
             }
         }
-
-        grad[3] = 0.5 * (A.cwiseProduct(dK)).sum();
+        grad[3] = 0.5 * (A.cwiseProduct(dK)).sum() * softplus_deriv(p[3]);
     }
 
     {
-        double sn2 = softplus(pp[4]);
-        MatrixXd dK = 2.0 * sn2 * MatrixXd::Identity(N, N);
-        grad[4] = 0.5 * (A.cwiseProduct(dK)).sum();
+        MatrixXd dK = MatrixXd::Identity(N, N);
+        grad[4] = 0.5 * (A.cwiseProduct(dK)).sum() * softplus_deriv(p[4]);
     }
 
-    if (!std::isfinite(ll))
-        return 1e50;
-
-    for (int i = 0; i < grad.size(); ++i)
-        if (!std::isfinite(grad[i]))
-            grad[i] = 0.0;
+    for (int i = 0; i < grad.size(); ++i) {
+        if (!std::isfinite(grad[i])) {
+            grad.setZero(5);
+            return 1e10;
+        }
+    }
 
     grad *= -1.0;
-    return -ll;
+    
+
+    double loss = -ll;
+
+    // Добавляем регуляризацию (L2-penalty / Ridge) на параметры.
+    // Это штрафует оптимизатор, если он пытается сделать параметры слишком большими.
+    double l2_reg = 0.1;
+    for (int i = 0; i < p.size(); ++i) {
+        loss += 0.5 * l2_reg * p[i] * p[i];
+        grad[i] += l2_reg * p[i]; // Корректируем градиент под штраф
+    }
+
+    return loss;
 }
 
 void GP3D::fit(const VectorXd& p) {
@@ -130,7 +148,10 @@ void GP3D::fit(const VectorXd& p) {
     MatrixXd K = computeK(p);
     LDLT<MatrixXd> ldlt(K);
     if (ldlt.info() != Success) return;
-    L = ldlt.matrixL();
+
+    MatrixXd D_sqrt = ldlt.vectorD().array().max(0.0).sqrt().matrix().asDiagonal();
+    L = MatrixXd(ldlt.matrixL()) * D_sqrt;
+
     alpha = ldlt.solve(y);
 }
 
@@ -168,8 +189,7 @@ std::pair<double, double> GP3D::predict(const Vector3d& x) const {
     double kxx = softplus(trained_params[3]);
     double var = kxx - v.squaredNorm();
 
-    if (!std::isfinite(var)) var = 1e-12;
-    if (var < 1e-12) var = 1e-12;
+    if (!std::isfinite(var) || var < 1e-12) var = 1e-12;
 
     return { mean, var };
 }

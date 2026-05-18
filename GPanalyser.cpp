@@ -15,9 +15,35 @@
 
 #include "src/gp3d.h"
 
+#include "src/CSVLoader.h"
+#include "src/FileDialog.h"
+
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
+
+#include <nanoflann.hpp>
+
+
+struct EigenMatrixAdaptor {
+    const Eigen::MatrixXd& obj;
+    EigenMatrixAdaptor(const Eigen::MatrixXd& obj) : obj(obj) {}
+
+    inline size_t kdtree_get_point_count() const { return obj.rows(); }
+
+    inline double kdtree_get_pt(const size_t idx, const size_t dim) const {
+        return obj(idx, dim);
+    }
+
+    template <class BBOX> bool kdtree_get_bbox(BBOX&) const { return false; }
+};
+
+typedef nanoflann::KDTreeSingleIndexAdaptor<
+    nanoflann::L2_Simple_Adaptor<double, EigenMatrixAdaptor>,
+    EigenMatrixAdaptor,
+    3
+> MyKDTree;
+
 
 bool invertConfidence = false;
 
@@ -28,7 +54,9 @@ void updateSurface(
     const Grid& grid,
     GP3D& gp,
     std::vector<float>& confidence,
-    float sliceW
+    float sliceW,
+    float centerX,
+    float centerY
 ) {
     confidence.clear();
 
@@ -43,8 +71,8 @@ void updateSurface(
         for (int i = 0; i < nodes; ++i) {
             for (int j = 0; j < nodes; ++j) {
 
-                float x = i * step - halfSize;
-                float y = j * step - halfSize;
+                float x = i * step - halfSize + centerX;
+                float y = j * step - halfSize + centerY;
 
                 Eigen::Vector3d p;
                 p << x, y, (double)sliceW;
@@ -114,6 +142,35 @@ void updateSurface(
 
 int main() {
 
+    struct AppState
+    {
+        bool datasetLoaded = false;
+
+        bool showStartupPopup = true;
+        bool showLoadPopup = false;
+
+        std::string path = "";
+
+        int delimiter = ',';
+
+        std::vector<std::string> headers;
+        std::vector<std::vector<double>> data;
+
+        int xCol = 0;
+        int yCol = 1;
+        int wCol = 2;
+        int tCol = 3;
+
+        float gridCenterX = 0.0f;
+        float gridCenterY = 0.0f;
+        float gridWidth = 20.0f;
+
+        int kNeighbors = 1500;
+        bool useLocalTraining = false;
+    };
+
+    AppState state;
+
     bool surfaceDirty = false;
 
 	float currentW = 0.0;
@@ -134,12 +191,7 @@ int main() {
     ImGui_ImplOpenGL3_Init("#version 330");
 
     LBFGSpp::LBFGSParam<double> param;
-    param.max_iterations = 100;
-    param.m = 6;                    
-    param.max_linesearch = 50;            
-    param.min_step = 1e-20;               
-    param.max_step = 1e3;                 
-    param.epsilon = 1e-4;
+    param.max_iterations = 50;
 
     LBFGSpp::LBFGSSolver<double> solver(param);
 
@@ -180,11 +232,11 @@ int main() {
     Eigen::VectorXd params(5);
 
     params <<
-        1.0,
-        1.0,
-        10.0,
-        0.0,
-        -2.0;
+        0.5,
+        0.5,
+        0.5,
+        0.8,
+        -1.5;
 
 
     double fx;
@@ -222,25 +274,37 @@ int main() {
 
     std::vector<float> vertexData;
 
-    updateSurface(vertexData, myGrid, gp, confidence, currentW);
+    updateSurface(vertexData, myGrid, gp, confidence, currentW, 0.0f, 0.0f);
+
+
+    float defaultParams[3];
+
+    for(unsigned int i = 0; i < 3; i++) {
+        defaultParams[i] = params[i];
+    }
+
+    auto im_softplus = [](double x) {
+        return std::log1p(std::exp(-std::abs(x))) + std::max(x, 0.0);
+    };
+
+    auto im_inv_softplus = [](double y)
+    {
+        return std::log(std::exp(y) - 1.0);
+    };
+
+    std::unique_ptr<EigenMatrixAdaptor> kdtreeAdaptor = nullptr;
+    std::unique_ptr<MyKDTree> kdTree = nullptr;
+
+    kdtreeAdaptor = std::make_unique<EigenMatrixAdaptor>(X);
+    kdTree = std::make_unique<MyKDTree>(3, *kdtreeAdaptor, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+    kdTree->buildIndex();
 
     while (!renderer.ShouldClose()) {
 
-        if (surfaceDirty) {
-            updateSurface(vertexData, myGrid, gp, confidence, currentW);
-            surfaceDirty = false;
-        }
 
         renderer.PollEvents();
 
         renderer.Clear();
-
-        renderer.UpdateGridData(
-            vertexData.data(),
-            vertexData.size() * sizeof(float)
-        );
-
-        renderer.DrawGrid(myGrid);
 
         ImGui_ImplOpenGL3_NewFrame();
 
@@ -248,35 +312,264 @@ int main() {
 
         ImGui::NewFrame();
 
+
+        auto trainLocalModel = [&](float queryX, float queryY, float queryW) {
+            if (!kdTree || X.rows() == 0) return;
+
+            int k = std::min(state.kNeighbors, (int)X.rows());
+
+            std::vector<size_t> ret_indexes(k);
+            std::vector<double> out_dists_sq(k);
+
+            double query_pt[3] = { (double)queryX, (double)queryY, (double)queryW };
+
+            nanoflann::KNNResultSet<double> resultSet(k);
+            resultSet.init(&ret_indexes[0], &out_dists_sq[0]);
+            kdTree->findNeighbors(resultSet, &query_pt[0], nanoflann::SearchParameters());
+
+            Eigen::MatrixXd localX(k, 3);
+            Eigen::VectorXd localY(k);
+
+            for (int i = 0; i < k; ++i) {
+                size_t idx = ret_indexes[i];
+                localX.row(i) = X.row(idx);
+                localY(i) = y(idx);
+            }
+
+            gp = GP3D(localX, localY, cfg);
+            double localFx;
+
+            LBFGSpp::LBFGSParam<double> localParam;
+            localParam.max_iterations = 20;
+            LBFGSpp::LBFGSSolver<double> localSolver(localParam);
+
+            try {
+                localSolver.minimize(gp, params, localFx);
+                gp.fit(params);
+            }
+            catch (...) {
+                gp.fit(params);
+            }
+        };
+
+
+        static bool firstFrame = true;
+
+        if (firstFrame) {
+            state.showStartupPopup = true;
+            firstFrame = false;
+        }
+
+        if (state.showStartupPopup) {
+            ImGui::OpenPopup("Startup");
+        }
+
+        if (state.showLoadPopup) {
+            ImGui::OpenPopup("Load Data");
+            state.showLoadPopup = false;
+        }
+
+        if (ImGui::BeginPopupModal("Startup", &state.showStartupPopup, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Load dataset to continue or explore the app");
+            ImGui::Separator();
+
+            if (ImGui::Button("Open CSV File", ImVec2(220, 0))) {
+                state.showLoadPopup = true;
+                state.showStartupPopup = false;
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::Spacing();
+
+            if (ImGui::Button("View Synthetic Test (Skip)", ImVec2(220, 0))) {
+                state.showStartupPopup = false;
+                ImGui::CloseCurrentPopup();
+            }
+
+            if (!state.showStartupPopup) {
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::EndPopup();
+        }
+
+        if (ImGui::BeginPopupModal("Load Data", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("File");
+
+            if (ImGui::Button("Open File")) {
+                state.path = OpenFileDialog();
+            }
+
+            ImGui::Text("%s", state.path.c_str());
+            ImGui::Separator();
+
+            ImGui::Text("Delimiter");
+            ImGui::RadioButton("Comma (,)", &state.delimiter, ',');
+            ImGui::RadioButton("Semicolon (;)", &state.delimiter, ';');
+            ImGui::RadioButton("Tab", &state.delimiter, '\t');
+
+            ImGui::Separator();
+
+            if (ImGui::Button("Load")) {
+                state.datasetLoaded = CSVLoader::Load(state.path, (char)state.delimiter, state.headers, state.data);
+
+                if (state.datasetLoaded) {
+                    CSVLoader::BuildDataset(state.data, state.xCol, state.yCol, state.wCol, state.tCol, X, y);
+
+                    double minX = X.col(0).minCoeff();
+                    double maxX = X.col(0).maxCoeff();
+                    double minY = X.col(1).minCoeff();
+                    double maxY = X.col(1).maxCoeff();
+
+                    state.gridCenterX = static_cast<float>((minX + maxX) / 2.0);
+                    state.gridCenterY = static_cast<float>((minY + maxY) / 2.0);
+
+                    float deltaX = static_cast<float>(maxX - minX);
+                    float deltaY = static_cast<float>(maxY - minY);
+                    state.gridWidth = std::max(deltaX, deltaY) * 1.1f;
+                    if (state.gridWidth < 0.001f) state.gridWidth = 1.0f;
+
+                    myGrid = Grid(state.gridWidth, 50);
+                    renderer.SetupGrid(myGrid);
+
+                    kdtreeAdaptor = std::make_unique<EigenMatrixAdaptor>(X);
+                    kdTree = std::make_unique<MyKDTree>(3, *kdtreeAdaptor, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+                    kdTree->buildIndex();
+
+                    gp = GP3D(X, y, cfg);
+                    solver.minimize(gp, params, fx);
+                    gp.fit(params);
+
+                    surfaceDirty = true;
+
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::EndPopup();
+        }
+
+        if (surfaceDirty) {
+            if (state.useLocalTraining && kdTree) {
+                trainLocalModel(state.gridCenterX, state.gridCenterY, currentW);
+            }
+
+            updateSurface(vertexData, myGrid, gp, confidence, currentW, state.gridCenterX, state.gridCenterY);
+            surfaceDirty = false;
+        }
+
+        renderer.UpdateGridData(vertexData.data(), vertexData.size() * sizeof(float));
+
+        renderer.DrawGrid(myGrid);
+
+
         ImGui::Begin("Settings");
 
         ImGui::Text("Gaussian Process");
 
-        ImGui::Text(
-            "Lengthscales: %.3f %.3f %.3f",
-            std::exp(params[0]),
-            std::exp(params[1]),
-            std::exp(params[2])
-        );
+        if (ImGui::Checkbox("Use Local KD-Tree Training", &state.useLocalTraining)) {
+            surfaceDirty = true;
+        }
+
+        if (state.useLocalTraining) {
+
+            int maxPoints = std::max((int)X.rows(), 10);
+            if (state.kNeighbors > maxPoints) state.kNeighbors = maxPoints / 2;
+
+            ImGui::SliderInt("Local Points (K)", &state.kNeighbors, 10, maxPoints);
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Training is extremely fast now!");
+        }
+
+        ImGui::Separator();
+
+
+        for (int i = 0; i < 3; ++i)
+        {
+            ImGui::PushID(i);
+
+            std::string label = "Lengthscale " + std::to_string(i);
+
+            float visibleValue = im_softplus(params[i]);
+
+            if (ImGui::SliderFloat(label.c_str(), &visibleValue, 0.01f, 20.0f))
+            {
+                params[i] = im_inv_softplus(visibleValue);
+            }
+
+            ImGui::SameLine();
+
+            if (ImGui::Button("Reset"))
+            {
+                params[i] = defaultParams[i];
+            }
+
+            ImGui::PopID();
+        }
 
         ImGui::Text(
             "Sigma_f: %.3f",
-            std::exp(params[3])
+            im_softplus(params[3])
         );
 
         ImGui::Text(
             "Sigma_n: %.3f",
-            std::exp(params[4])
+            im_softplus(params[4])
         );
 
-        ImGui::SliderFloat("Z-Slice (W)", &currentW, -10.0f, 10.0f);
+        float wMin = -10.0f;
+        float wMax = 10.0f;
+
+        if (state.datasetLoaded && !X.col(2).isZero())
+        {
+            wMin = (float)X.col(2).minCoeff();
+            wMax = (float)X.col(2).maxCoeff();
+        }
+
+        ImGui::SliderFloat("W-Slice ", &currentW, wMin, wMax);
 
         if (ImGui::Checkbox("Invert confidence", &invertConfidence)) {
             surfaceDirty = true;
         }
 
         if (ImGui::Button("Rebuild Surface")) {
-            updateSurface(vertexData, myGrid, gp, confidence, currentW);
+
+            if (state.useLocalTraining) {
+                trainLocalModel(state.gridCenterX, state.gridCenterY, currentW);
+            }
+            else {
+                gp.fit(params);
+            }
+
+            if (X.rows() > 0) {
+
+                double minX = X.col(0).minCoeff(); double maxX = X.col(0).maxCoeff();
+                double minY = X.col(1).minCoeff(); double maxY = X.col(1).maxCoeff();
+
+                state.gridCenterX = static_cast<float>((minX + maxX) / 2.0);
+                state.gridCenterY = static_cast<float>((minY + maxY) / 2.0);
+
+                float deltaX = static_cast<float>(maxX - minX); 
+                float deltaY = static_cast<float>(maxY - minY);
+
+                state.gridWidth = std::max(deltaX, deltaY) * 1.1f;
+                if (state.gridWidth < 0.001f) state.gridWidth = 1.0f;
+                myGrid = Grid(state.gridWidth, 100);
+                renderer.SetupGrid(myGrid);
+            }
+
+            updateSurface(vertexData, myGrid, gp, confidence, currentW, state.gridCenterX, state.gridCenterY);
+
+        }
+
+        if (ImGui::Button("Load Data"))
+        {
+            state.showLoadPopup = true;
+            ImGui::OpenPopup("Load Data");
         }
 
         ImGui::End();
